@@ -683,7 +683,7 @@ int L1RpcServer::_handle_request(zmq::message_t& client, const zmq::message_t& r
 	    this->_slow_pulsar_writer_hash->get(target_ibeam)
 		->set_params(target_beam, nfreq, ntime, nbins, base_path);
 			     
-	    chlog("Pulsar writer paramter update" << std::endl << "\tnfreq_out: " << nfreq
+	    chlog("Pulsar writer parameter update" << std::endl << "\tnfreq_out: " << nfreq
 		  << std::endl <<  "\tntime_out: " << ntime << std::endl << "\tnbins: " 
 		  << nbins << std::endl << "base_path: " << *base_path << std::endl);
 
@@ -1151,7 +1151,7 @@ int L1RpcServer::_handle_write_chunks(zmq::message_t& client, string funcname, u
         
     // "v1" write_chunks requests have 9 arguments; "v2" have 10 arguments ("need_rfi" flag added)
     msgpack::object obj = oh.get();
-    cout << "Write_chunks request: arguments size " << obj.via.array.size << endl;
+    //cout << "Write_chunks request: arguments size " << obj.via.array.size << endl;
     WriteChunks_Request req;
     if (obj.via.array.size == 9) {
         req = oh.get().as<WriteChunks_Request>();
@@ -1161,19 +1161,44 @@ int L1RpcServer::_handle_write_chunks(zmq::message_t& client, string funcname, u
         need_rfi = req2.need_rfi;
     }
 
-    /*
-     cout << "WriteChunks request: FPGA range " << req.min_fpga << "--" << req.max_fpga << endl;
-     cout << "beams: [ ";
-     for (auto beamit = req.beams.begin(); beamit != req.beams.end(); beamit++)
-     cout << (*beamit) << " ";
-     cout << "]" << endl;
-     */
+    std::ostringstream beamstr;
+    if (req.beams.size() > 1)
+        beamstr << "[ ";
+    for (size_t i=0; i<req.beams.size(); i++) {
+        if (i)
+            beamstr << ", ";
+        beamstr << req.beams[i];
+    }
+    if (req.beams.size() > 1)
+        beamstr << " ]";
+    uint64_t fpga_now = _stream->packet_max_fpga_seen;
+    double dt_fpga = ch_frb_io::constants::dt_fpga;
+    auto stats = _stream->get_statistics();
+    // the stats have two general dicts, then one dict per beam.  Assume the FPGA ranges of all beams are the same!
+    uint64_t fpga_ringbuf_min = 0;
+    try {
+        if (stats.size() >= 3)
+            fpga_ringbuf_min = stats[2]["ringbuf_fpga_min"];
+    } catch (const runtime_error &e) {
+    }
+    std::ostringstream rbstr;
+    if (fpga_ringbuf_min)
+        rbstr << "  Ringbuffer has data up to " << (fpga_now - fpga_ringbuf_min)*dt_fpga << " seconds old";
+    chlog("RPC request to save intensity data for beams " << beamstr.str() << " and FPGA range " <<
+          req.min_fpga << " to " << req.max_fpga << "; FPGA counts now = " << fpga_now <<
+        ", so requested range is " << std::setprecision(3) << (fpga_now - req.min_fpga)*dt_fpga <<
+          " to " << (fpga_now - req.max_fpga)*dt_fpga << " seconds ago." << rbstr.str());
 
     // Retrieve the chunks requested.
     vector<shared_ptr<assembled_chunk> > chunks;
     _get_chunks(req.beams, req.min_fpga, req.max_fpga, chunks);
 
-    //cout << "get_chunks: got " << chunks.size() << " chunks" << endl;
+    for (const auto &chunk : chunks) {
+        chlog("  saving intensity data: beam " << chunk->beam_id << ", FPGA range " <<
+              chunk->fpga_begin << " to " << chunk->fpga_end << ", or " << std::setprecision(3) <<
+              (fpga_now - chunk->fpga_begin)*dt_fpga << " seconds ago, duration " <<
+              chunk->binning << " second(s)");
+    }
 
     // Keep a list of the chunks to be written; we'll reply right away with this list.
     vector<WriteChunks_Reply> reply;
@@ -1599,14 +1624,14 @@ void L1RpcServer::_get_chunks(const vector<int> &beams,
 void L1RpcServer::_update_n_chunks_waiting(bool inc) {
     if (inc) {
         if (_n_chunks_writing == 0) {
-            cout << "Writing chunks.  Pausing packet forking." << endl;
+            cout << "Writing chunks.  Pausing packet forking (if running)." << endl;
             _stream->pause_forking_packets();
         }
         _n_chunks_writing++;
     } else {
         _n_chunks_writing--;
         if (_n_chunks_writing == 0) {
-            cout << "Finished writing chunks.  Resuming packet forking." << endl;
+            cout << "Finished writing chunks.  Resuming packet forking (if applicable)." << endl;
             _stream->resume_forking_packets();
         }
     }
