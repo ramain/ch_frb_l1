@@ -1009,7 +1009,7 @@ void l1_server::spawn_l1b_subprocesses()
 	vector<string> l1b_command_line = {
 	    config.l1b_executable_filename,
 	    config.l1b_config_filename,
-            std::to_string(ibeam)
+            //std::to_string(ibeam)
 	};
 	
 	bonsai::trigger_pipe::initializer l1b_initializer;
