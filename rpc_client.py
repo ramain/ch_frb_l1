@@ -521,6 +521,7 @@ class RpcClient(object):
     def inject_single_pulse(self, beam, sp, fpga0, nfreq=16384,
                             fpga_counts_per_sample=384, fpga_period=2.56e-6,
                             spectral_modulation=None,
+                            shift_t0=False,
                             **kwargs):
         '''
         Injects a *simpulse* simulated pulse *sp* into the given *beam*, starting
@@ -549,7 +550,10 @@ class RpcClient(object):
             for n in sparse_n:
                 data.append(sparse_data[ntotal:ntotal+n])
                 ntotal += n
-        fpga_offset = int(fpga0 + (t0 / fpga_period))
+        if shift_t0:
+            fpga_offset = fpga0
+        else:
+            fpga_offset = int(fpga0 + (t0 / fpga_period))
         injdata = InjectData(beam, 0, fpga_offset, sparse_i0, data)
         # Simpulse orders frequencies low to high.
         freq_low_to_high = True
