@@ -35,15 +35,13 @@ RFI_CONFIG=21-03-07-low-latency-uniform-badchannel-mask-noplot.json
 #BONSAI_CONFIG=bonsai_production_noups_nbeta2_v4.hdf5
 BONSAI_CONFIG=bonsai_production_fixed_coarse_graining_hybrid_0.8_0.015.hdf5
 
-if [ $(hostname) == cf1n1 ]; then
-    VERSION=dev7
-    # Pick up our locally-installed zeromq library...
-    export LD_LIBRARY_PATH=/usr/local/zeromq-4.3.4/lib:${LD_LIBRARY_PATH}
-elif [ $(hostname) == cf4n2 ]; then
-    VERSION=dev7
-    # Pick up our locally-installed zeromq library...
-    export LD_LIBRARY_PATH=/usr/local/zeromq-4.3.4/lib:${LD_LIBRARY_PATH}
+# Chia Min 2022-03-29 : Why are these nodes running dev7?
+# if [ $(hostname) == cf1n1 ]; then
+#     VERSION=dev7
+# elif [ $(hostname) == cf4n2 ]; then
+#     VERSION=dev7
 
+# Old injection testing
 # elif [ $(hostname) == cf5n3 ]; then
 #     # singlebeam -- start services
 #     sudo /home/l1operator/start-singlebeam.sh
@@ -56,33 +54,35 @@ elif [ $(hostname) == cf4n2 ]; then
 #     VERSION=dev6
 #     L1B_CONFIG=L1b_config_save_triggers.yaml
 
-elif [[ $(hostname) == cf1n7 || $(hostname) == cf4n9 ||  $(hostname) == cf8n1 || $(hostname) == cfbn3 || $(hostname) == cf7n3 ]]; then
-    echo "I am $(hostname) aka rack $rack node $node.  Running SPS version (saving triggers)"
-    VERSION=sps-dstn
-    # Needed? L1_ARGS=-b -i
-    L1B_CONFIG=L1b_config_save_triggers.yaml
-    RFI_CONFIG=21-07-06-low-latency-uniform-badchannel-mask-noplot-spsfirst.json
-
-# Kathryn SPS project
-elif [[ $(hostname) == cf2n5 || $(hostname) == cf5n7 ||  $(hostname) == cf8n9 || $(hostname) == cfcn1 || $(hostname) == cf2n6 || $(hostname) == cf5n8 || $(hostname) == cf9n0 || $(hostname) == cfcn2 ]]; then
-    echo "I am $(hostname) aka rack $rack node $node.  Running SPS version (saving triggers)"
-    VERSION=sps-dstn
-    # Needed? L1_ARGS=-b -i
-    L1B_CONFIG=L1b_config_save_triggers.yaml
-    RFI_CONFIG=21-07-06-low-latency-uniform-badchannel-mask-noplot-spsfirst.json
+# Dustin commented-out 2022-01-24 to debug missing triggers from these nodes
+# elif [[ $(hostname) == cf1n7 || $(hostname) == cf4n9 ||  $(hostname) == cf8n1 || $(hostname) == cfbn3 || $(hostname) == cf7n3 ]]; then
+#     echo "I am $(hostname) aka rack $rack node $node.  Running SPS version (saving triggers)"
+#     VERSION=sps-dstn
+#     # Needed? L1_ARGS=-b -i
+#     L1B_CONFIG=L1b_config_save_triggers.yaml
+#     RFI_CONFIG=21-07-06-low-latency-uniform-badchannel-mask-noplot-spsfirst.json
+# 
+# # Kathryn SPS project
+# elif [[ $(hostname) == cf2n5 || $(hostname) == cf5n7 ||  $(hostname) == cf8n9 || $(hostname) == cfcn1 || $(hostname) == cf2n6 || $(hostname) == cf5n8 || $(hostname) == cf9n0 || $(hostname) == cfcn2 ]]; then
+#     echo "I am $(hostname) aka rack $rack node $node.  Running SPS version (saving triggers)"
+#     VERSION=dev10
+#     # Needed? L1_ARGS=-b -i
+#     L1B_CONFIG=L1b_config_save_triggers.yaml
+#     RFI_CONFIG=21-07-06-low-latency-uniform-badchannel-mask-noplot-spsfirst.json
 
 # Marcus 2020-03-18: changed from cf5n2 to cfan6
-elif [ $(hostname) == cfan6 ]; then
+if [ $(hostname) == cfan6 ]; then
      echo "I am $(hostname) aka rack $rack node $node .  Running DEV6 version (receiver)"
      VERSION=dev6
      L1_ARGS=-f -b -i
      L1_CONFIG=l1_configs/l1_production_8beam_receiver.yaml
 
 # Marcus 2020-06-17: Testing injections on all of rack 5
-elif [ $rack == 5 ]; then
-    echo "I am $(hostname) aka rack $rack node $node .  Running DEV6 version (sender)"
-    VERSION=dev6
-    L1_ARGS=-b -i
+# Marcus 2022-03-29: Pretty sure this is deprecated, commenting out
+# elif [ $rack == 5 ]; then
+#    echo "I am $(hostname) aka rack $rack node $node .  Running DEV6 version (sender)"
+#    VERSION=dev6
+#    L1_ARGS=-b -i
 
 # Alex Roman 2021-08-31 debug node
 elif [ $(hostname) == cf7n3 ]; then
@@ -106,12 +106,29 @@ elif [ $(hostname) == cf7n3 ]; then
 #     #BONSAI_CONFIG=bonsai_production_noups_nbeta2_v4.hdf5
 #     BONSAI_CONFIG=bonsai_production_fixed_coarse_graining_hybrid_0.8_0.015.hdf5
 
+# Dustin Lang 2024-04-19 L1b dump data collection
+# elif [ $(hostname) == cf1n1 ]; then
+#     echo "I am $(hostname) aka rack $rack node $node.  Running L1b dump version"
+#     VERSION=l1b-dump
+#     L1_CONFIG=l1_configs/l1_l1b_dump.yaml
+#     L1B_CONFIG=L1b_dump.yaml
+
+# # Dustin Lang 2024-04-30 - test new prod candidate
+# elif [ $(hostname) == cf1n1 ]; then
+#     echo "I am $(hostname) aka rack $rack node $node.  Running dev12 version"
+#     VERSION=dev12
+
 else
     # Davor 2020-10-07: Use version dev6 to handle the L0 format with frame0 field
     # Shriharsh 2020-06-24: Started using dev5 version in all nodes.
-    echo "I am $(hostname) aka rack $rack node $node .  Running DEV6 version"
-    VERSION=dev6
+    # Chia Min 2022-03-29: Deploying dev10 version with SPS acquisition capability
+    # Dustin 2023-03-02: Deploying dev11 version with assembler-misses RPC call
+    echo "I am $(hostname) aka rack $rack node $node .  Running dev12 version"
+    VERSION=dev12
 fi
+
+# Pick up our locally-installed zeromq library...
+export LD_LIBRARY_PATH=/usr/local/zeromq-4.3.4/lib:${LD_LIBRARY_PATH}
 
 export LD_LIBRARY_PATH="/home/l1operator/${VERSION}/lib:$LD_LIBRARY_PATH"
 export PATH="/home/l1operator/${VERSION}/bin:$PATH"
