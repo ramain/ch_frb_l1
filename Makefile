@@ -41,13 +41,20 @@ SCRIPTS := ch-frb-make-acq-inventory
 INSTALLED_BINARIES := ch-frb-l1 ch-frb-simulate-l0
 NON_INSTALLED_BINARIES := rpc-client test-l1-rpc test-packet-rates
 
-all: $(INSTALLED_BINARIES) $(NON_INSTALLED_BINARIES) simulate_l0.so
+all: $(INSTALLED_BINARIES) $(NON_INSTALLED_BINARIES) simulate_l0.so l1_server.so
 
 .PHONY: all install uninstall
 
-INCFILES := ch_frb_l1.hpp l1-rpc.hpp rpc.hpp
+# Eliminate make's builtin rules (which for some reason I haven't figured out, were overriding
+# our perfectly good .cpp -> .o rule...
+.SUFFIXES:
 
-L1_OBJS := l1-rpc.o mask_stats.o
+debug: ch-frb-l1 ch-frb-simulate-l0 rpc-client test-l1-rpc test-packet-rates simulate_l0.so
+.PHONY: debug
+
+INCFILES := ch_frb_l1.hpp l0-sim.hpp l1-rpc.hpp rpc.hpp mask_stats.hpp slow_pulsar_writer_hash.hpp
+
+L1_OBJS := l1-rpc.o mask_stats.o zmq-monitor.o
 
 # Append compile flags
 CPP_CFLAGS ?=
@@ -68,8 +75,11 @@ civetweb/civetweb.o: civetweb/civetweb.c
 rpc-client: rpc_client.o
 	$(CPP) -o $@ $^ $(CPP_LFLAGS) -lch_frb_io -lzmq
 
-ch-frb-l1: ch-frb-l1.o file_utils.o yaml_paramfile.o $(L1_OBJS) $(CIVET_OBJS)
-	$(CPP) -o $@ $^ $(CPP_LFLAGS) -lrf_pipelines -lbonsai -lch_frb_io -lrf_kernels -lzmq -lyaml-cpp -ljsoncpp -ldl -lcurl
+ch-frb-l1: ch-frb-l1-main.o ch-frb-l1.o file_utils.o yaml_paramfile.o $(L1_OBJS) $(CIVET_OBJS)
+	$(CPP) -o $@ $^ $(CPP_LFLAGS) -lrf_kernels -lrf_pipelines -lbonsai -lch_frb_io -lzmq -lyaml-cpp -ljsoncpp -ldl -lcurl
+
+l0-timing: l0-timing.o
+	$(CPP) -o $@ $^ $(CPP_LFLAGS) -lch_frb_io
 
 ch-frb-simulate-l0: ch-frb-simulate-l0.o simulate-l0.o file_utils.o yaml_paramfile.o
 	$(CPP) -o $@ $^ $(CPP_CFLAGS) $(CPP_LFLAGS) -lch_frb_io -lyaml-cpp
@@ -79,6 +89,9 @@ PYTHON ?= python
 simulate_l0.so: simulate_l0_py.o simulate-l0.o file_utils.o yaml_paramfile.o
 	$(CPP) $(CPP_LFLAGS) -shared -o $@ $^ -lch_frb_io -lyaml-cpp $(LIBS_PYMODULE)
 
+l1_server.so: l1_server_py.o ch-frb-l1.o file_utils.o yaml_paramfile.o $(L1_OBJS) $(CIVET_OBJS)
+	$(CPP) $(CPP_LFLAGS) -shared -o $@ $^ -lrf_pipelines -lbonsai -lch_frb_io -lrf_kernels -lzmq -lyaml-cpp -ljsoncpp -ldl -lcurl -lyaml-cpp $(LIBS_PYMODULE)
+
 ch-frb-test: ch-frb-test.cpp $(L1_OBJS)
 	$(CPP) -o $@ $^ $(CPP_CFLAGS) $(CPP_LFLAGS) -lch_frb_io -lzmq -lhdf5
 
@@ -86,10 +99,10 @@ ch-frb-test-debug: ch-frb-test.cpp $(L1_OBJS) $(IO_OBJS)
 	$(CPP) -o $@ $^ $(CPP_CFLAGS) $(CPP_LFLAGS) -lzmq -lhdf5 -llz4
 
 test-l1-rpc: test-l1-rpc.cpp $(L1_OBJS) file_utils.o $(CIVET_OBJS)
-	$(CPP) $(CPP_CFLAGS) $(CPP_LFLAGS) -o $@ $^ -lzmq -lhdf5 -llz4 -lbonsai -lrf_pipelines -lch_frb_io -ldl
+	$(CPP) $(CPP_CFLAGS) $(CPP_LFLAGS) -o $@ $^ -lzmq -lhdf5 -llz4 -lrf_kernels -lbonsai -lrf_pipelines -lch_frb_io -ldl
 
 test-packet-rates: test-packet-rates.cpp $(L1_OBJS) file_utils.o $(CIVET_OBJS)
-	$(CPP) $(CPP_CFLAGS) $(CPP_LFLAGS) -o $@ $^ -lzmq -lhdf5 -llz4 -l bonsai -lrf_pipelines -lch_frb_io -ldl
+	$(CPP) $(CPP_CFLAGS) $(CPP_LFLAGS) -o $@ $^ -lzmq -lhdf5 -llz4 -lrf_kernels -lbonsai -lrf_pipelines -lch_frb_io -ldl
 
 clean:
 	rm -f *.o *~ civetweb/*.o civetweb/*~ $(INSTALLED_BINARIES) $(NON_INSTALLED_BINARIES) simulate_l0.so terminus-l1 hdf5-stream

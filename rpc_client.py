@@ -15,7 +15,33 @@ results.
 This client can talk to multiple RPC servers at once.
 '''
 
+def gpu_node_name_from_ip(ip):
+    numbers = [int(x) for x in ip.split('.')]
+    assert(numbers[0] == 10)
+    assert(numbers[1] in [5, 6])
+    assert(((numbers[2] >= 0) and (numbers[2] <= 13)) or
+           ((numbers[2] >= 100) and (numbers[2] <= 113)))
+    assert(numbers[3] >= 10)
+    assert(numbers[3] <= 19)
+
+    ns = 's' if (numbers[2] >= 100) else 'n'
+    rack = '%x' % (numbers[2] % 100)
+    node = '%i' % (numbers[3] - 10)
+    return 'c%s%sg%s' % (ns, rack, node)
+
+
 class AssembledChunk(object):
+    '''
+    This class represents an "assembled chunk" of CHIME/FRB intensity
+    data read from a msgpack-format file.
+
+    You probably want to use *read_msgpack_file* to create one of
+    these, and then use *decode* to produce arrays of Intensity and Weights.
+
+    Note that rf_pipelines and bonsai assume a frequency ordering of
+    high-to-low, so *intensities*[0,0] is the intensity for the first time
+    sample and highest frequency (800 MHz).
+    '''
     def __init__(self, msgpacked_chunk):
         c = msgpacked_chunk
         # print('header', c[0])
@@ -82,8 +108,8 @@ class AssembledChunk(object):
         if self.has_rfi_mask:
             h,w = self.rfi_mask.shape
             masked = np.sum(self.rfi_mask == 0)
-            rfistr = ('yes, %i freqs, %i%% masked' %
-                      (self.nrfifreq, int(100. * masked / (h*w))))
+            rfistr = ('yes, %i freqs, %.2f%% masked' %
+                      (self.nrfifreq, (100. * masked) / float(h*w)))
         else:
             rfistr = 'no'
         return ('AssembledChunk: beam %i, nt %i, fpga0 %i, rfi %s' %
@@ -110,18 +136,29 @@ class AssembledChunk(object):
         return intensities,weights
 
     def time_start(self):
+        '''
+        Returns a unix-time (seconds since 1970) value for the start of this
+        chunk of data.
+        '''
         # Nanoseconds per FPGA count
         fpga_nano = 2560
         return 1e-9 * (self.frame0_nano +
                        self.fpga_counts_per_sample * fpga_nano * self.fpga0)
 
     def time_end(self):
+        '''
+        Returns a unix-time (seconds since 1970) value for the end of this
+        chunk of data.
+        '''
         # Nanoseconds per FPGA count
         fpga_nano = 2560
         return 1e-9 * (self.frame0_nano +
                        self.fpga_counts_per_sample * fpga_nano * (self.fpga0 + self.fpgaN))
 
 def read_msgpack_file(fn):
+    ''' Reads the given *fn* msgpack-formatted CHIME/FRB intensity
+    data ("assembled chunk").
+    '''
     f = open(fn, 'rb')
     m = msgpack.unpackb(f.read())
     return AssembledChunk(m)
@@ -152,6 +189,10 @@ class WriteChunkReply(object):
         return str(self)
 
 class MaskedFrequencies(object):
+    '''
+    The reply to a *get_masked_frequencies* RPC request: a vector of (beam, where) ->
+    spectrum mappings giving the fraction of masked samples.
+    '''
     def __init__(self, msgpack):
         #print('Masked frequencies: got ', msgpack)
         self.histories = {}
@@ -161,7 +202,44 @@ class MaskedFrequencies(object):
             where = where.decode()
             self.histories[(beam, where)] = np.array(hist).astype(np.float32) / nt
 
+
+class SummedMaskedFrequencies(object):
+    '''
+    The reply to a *get_summed_masked_frequencies* RPC request: data
+    about the fraction of masked samples, by frequency, for a given
+    beam, FPGAcounts time range, and place in the RFI chain.
+    '''
+    @staticmethod
+    def parse(msgpack):
+        # List, one element per beam
+        rtn = []
+        for m in msgpack:
+            mm = SummedMaskedFrequencies(*m)
+            rtn.append(mm)
+        return rtn
+
+    def __init__(self, beam, fpga_start, fpga_end, pos_start, nt, nf, nsamples,
+                 nsamples_unmasked, freqs_masked_array):
+        self.beam = beam
+        self.fpga_start = fpga_start
+        self.fpga_end   = fpga_end
+        self.pos_start = pos_start
+        self.nt = nt
+        self.nf = nf
+        self.nsamples = nsamples
+        self.nsamples_unmasked = nsamples_unmasked
+        self.nsamples_masked = nsamples - nsamples_unmasked
+        self.freqs_masked = np.array(freqs_masked_array)
+
+    def __str__(self):
+        return ('SummedMaskedFreq: beam %i, samples %i + %i, nf %i, total masked %i/%i = %.1f %%, frequency histogram: length %i, type %s' %
+                (self.beam, self.pos_start, self.nt, self.nf, self.nsamples_masked, self.nsamples, 100.*(self.nsamples_masked)/float(self.nsamples), len(self.freqs_masked), self.freqs_masked.dtype))
+
+
 class PacketRate(object):
+    '''
+    The return type for the *get_packet_rate* RPC call.
+    '''
     def __init__(self, msgpack):
         self.start = msgpack[0]
         self.period = msgpack[1]
@@ -169,9 +247,75 @@ class PacketRate(object):
 
     def __str__(self):
         return 'PacketRate: start %g, period %g, packets: ' % (self.start, self.period) + str(self.packets)
-        
+
+class InjectData(object):
+    '''
+    Input datatype for the *inject_data* RPC call.
+    '''
+    # matching rf_pipelines_inventory :: inject_data + ch_frb_l1 :: rpc.hpp
+    def __init__(self, beam, mode, fpga0, sample_offsets, data):
+        '''
+        *beam*: integer.
+        *mode*: 0 = ADD to stream.
+        *fpga0*: FPGAcounts of the reference time when these data should be injected.
+          The sample times in *sample_offsets* are relative to this FPGAcounts time.
+        *sample_offsets*: numpy array of ints, one per frequency.  The intensity sample
+          offset (ie, time offset in ~ milliseconds) when data for this frequency should
+          be injected.
+        *data*: list of numpy arrays, one per frequency; the data to be injected.
+
+        This is a hybrid sparse representation:
+        - every frequency is assumed to be represented
+        - each frequency can have a different number of samples (including zero),
+          and starts at a different time offset.
+
+        Frequency index *f* will get a set of samples injected
+        starting at time sample *s0 + sample_offset[f]*, where *s0* is
+        *fpga0* converted to a sample number.  The data in *data[f]*
+        will be injected.
+
+        Note that this class doesn't care whether data are ordered with the lowest
+        frequency first or last in the array.
+        '''
+        # CHIME/FRB values:
+        if len(sample_offsets) != 16384:
+            print('Warning: expect sample_offsets to have length 16384, got', len(sample_offsets))
+        if len(data) != 16384:
+            print('Warning: expect *data* list to have length 16384, got', len(data))
+        #assert(len(sample_offsets) == 16384)
+        #assert(len(data) == 16384)
+        self.beam = beam
+        self.mode = mode
+        self.fpga0 = fpga0
+        self.sample_offsets = sample_offsets
+        self.data = data
+
+    def pack(self, freq_low_to_high):
+        # The wire format assumes frequencies are ordered high to low.
+        data = self.data
+        offsets = self.sample_offsets
+        if freq_low_to_high:
+            # Flip!!
+            data = list(reversed(data))
+            offsets = offsets[::-1]
+
+        ndata = np.array([len(d) for d in data]).astype(np.uint16)
+        alldata = np.hstack(data).astype(np.float32)
+        # msgpack_binary_vector: version 1 packing.
+        v = 1
+        msg = [self.beam, self.mode, self.fpga0,
+               [v, len(offsets),
+                bytes(offsets.astype(np.int32).data)],
+                [v, len(ndata),
+                 bytes(ndata.data)],
+                [v, len(alldata),
+                 bytes(alldata.data)]]
+        packer = msgpack.Packer(use_single_float=True, use_bin_type=True)
+        b = packer.pack(msg)
+        return b
+
 class RpcClient(object):
-    def __init__(self, servers, context=None, identity=None):
+    def __init__(self, servers, context=None, identity=None, debug=False):
         '''
         *servers*: a dict of [key, address] entries, where each
           *address* is a string address of an RPC server: eg,
@@ -181,12 +325,15 @@ class RpcClient(object):
            my socket.
 
         *identity*: (ignored; here for backward-compatibility)
+
+        NOTE throughout this class that *timeout* is in *milliseconds*!
         '''
         if context is None:
             self.context = zmq.Context()
         else:
             self.context = context
 
+        self.do_debug = debug
         self.servers = servers
         self.sockets = {}
         self.rsockets = {}
@@ -199,6 +346,27 @@ class RpcClient(object):
         # Buffer of received messages: token->[(message,socket), ...]
         self.received = {}
 
+    def set_spulsar_writer_params(self, nfreq_out, nds_out, nbits_out, servers=None, timeout=-1):
+        if servers is None:
+            servers = self.servers.keys()
+        tokens = []
+
+        for k in servers:
+            self.token += 1
+            req = msgpack.packb(['set_spulsar_writer_params', self.token])
+            args = msgpack.packb([int(nfreq_out), int(nds_out), int(nbits_out)]);
+            tokens.append(self.token)
+            self.sockets[k].send(req + args)
+        ret = self.wait_for_tokens(tokens, timeout=timeout)
+        # We expect one message part for each token.
+        return [msgpack.unpackb(p[0]) if p is not None else None
+                for p in parts]
+
+    def debug(self, *args):
+        if not self.do_debug:
+            return
+        print(*args)
+        
     def get_statistics(self, servers=None, wait=True, timeout=-1):
         '''
         Retrieves statistics from each server.  Return value is one
@@ -217,6 +385,7 @@ class RpcClient(object):
             return tokens
         parts = self.wait_for_tokens(tokens, timeout=timeout)
         # We expect one message part for each token.
+        self.debug('get_statistics raw reply:', parts)
         return [msgpack.unpackb(p[0]) if p is not None else None
                 for p in parts]
 
@@ -274,10 +443,159 @@ class RpcClient(object):
         return [msgpack.unpackb(p[0]) if p is not None else None
                 for p in parts]
 
+    def get_assembler_misses(self,
+                             servers=None, wait=True, timeout=-1):
+        if servers is None:
+            servers = self.servers.keys()
+        tokens = []
+        for k in servers:
+            self.token += 1
+            req = msgpack.packb(['get_assembler_misses', self.token])
+            tokens.append(self.token)
+            self.sockets[k].send(req)
+        if not wait:
+            return tokens
+        parts = self.wait_for_tokens(tokens, timeout=timeout)
+        # We expect one message part for each token.
+        return [msgpack.unpackb(p[0]) if p is not None else None
+                for p in parts]
+
+    def start_fork(self, beam_offset, ipaddr, port, beam=0,
+                   servers=None, wait=True, timeout=-1):
+        '''
+        beam=0 means send all beams handled by this node.
+
+        If beam != 0, then beam_offset is the destination beam number (not offset)
+        '''
+        if servers is None:
+            servers = self.servers.keys()
+        tokens = []
+        for k in servers:
+            self.token += 1
+            req = msgpack.packb(['start_fork', self.token])
+            args = msgpack.packb([beam, beam_offset, ipaddr, port])
+            tokens.append(self.token)
+            self.sockets[k].send(req + args)
+        if not wait:
+            return tokens
+        parts = self.wait_for_tokens(tokens, timeout=timeout)
+        # We expect one message part for each token.
+        return [msgpack.unpackb(p[0]) if p is not None else None
+                for p in parts]
+
+    def stop_fork(self, beam_offset, ipaddr, port, beam=0,
+                   servers=None, wait=True, timeout=-1):
+        if servers is None:
+            servers = self.servers.keys()
+        tokens = []
+        for k in servers:
+            self.token += 1
+            req = msgpack.packb(['stop_fork', self.token])
+            args = msgpack.packb([beam, beam_offset, ipaddr, port])
+            tokens.append(self.token)
+            self.sockets[k].send(req + args)
+        if not wait:
+            return tokens
+        parts = self.wait_for_tokens(tokens, timeout=timeout)
+        # We expect one message part for each token.
+        return [msgpack.unpackb(p[0]) if p is not None else None
+                for p in parts]
+    
+    def inject_data(self, inj, freq_low_to_high,
+                    servers=None, wait=True, timeout=-1):
+        '''
+        Sends data to be injected.  The beam number, time, and data
+        are in the *inj* data structure.  Please see the *InjectData*
+        class for a detailed explanation of that data structure.
+
+        *freq_low_to_high*: boolean, required.  If True, frequencies in *inj*
+        are assumed to be ordered from lowest frequency to highest frequency.
+        This is the order returned by simpulse by default.
+
+        (Note that rf_pipelines and bonsai assume high-to-low frequency
+        ordering.)
+
+        '''
+        if servers is None:
+            servers = self.servers.keys()
+        tokens = []
+        for k in servers:
+            self.token += 1
+            req = msgpack.packb(['inject_data', self.token])
+            args = inj.pack(freq_low_to_high)
+            print('inject_data argument:', len(args), 'bytes')
+            tokens.append(self.token)
+            self.sockets[k].send(req + args)
+        if not wait:
+            return tokens
+        parts = self.wait_for_tokens(tokens, timeout=timeout)
+        # We expect one message part for each token.
+        return [msgpack.unpackb(p[0]) if p is not None else None
+                for p in parts]
+
+    def inject_single_pulse(self, beam, sp, fpga0, nfreq=16384,
+                            fpga_counts_per_sample=384, fpga_period=2.56e-6,
+                            spectral_modulation=None,
+                            shift_t0=False,
+                            **kwargs):
+        '''
+        Injects a *simpulse* simulated pulse *sp* into the given *beam*, starting
+        at the reference time *fpga0* in FPGAcounts units.
+        '''
+        # NOTE, some approximations here
+        t0,t1 = sp.get_endpoints()
+        sample_period = fpga_counts_per_sample * fpga_period
+        nt = int(np.ceil((t1 - t0) / sample_period))
+        t1x = t0 + nt*sample_period
+        nsparse = sp.get_n_sparse(t0, t1x, nt)
+        print('Pulse time range:', t0, t1x, 'NT', nt, 'N sparse:', nsparse)
+        sparse_data = np.zeros(nsparse, np.float32)
+        sparse_i0 = np.zeros(nfreq, np.int32)
+        sparse_n = np.zeros(nfreq, np.int32)
+        sp.add_to_timestream_sparse(sparse_data, sparse_i0, sparse_n, t0, t1x, nt, 1.)
+        # convert sparse_data into a list of numpy arrays (one per freq)
+        data = []
+        ntotal = 0
+        if spectral_modulation is not None:
+            if len(spectral_modulation) != nfreq:
+                raise RuntimeError('spectral_modulation, if given, must be an array with length nfreq')
+            for i,n in enumerate(sparse_n):
+                data.append(sparse_data[ntotal:ntotal+n] * spectral_modulation[i])
+        else:
+            for n in sparse_n:
+                data.append(sparse_data[ntotal:ntotal+n])
+                ntotal += n
+        if shift_t0:
+            fpga_offset = fpga0
+        else:
+            fpga_offset = int(fpga0 + (t0 / fpga_period))
+        injdata = InjectData(beam, 0, fpga_offset, sparse_i0, data)
+        # Simpulse orders frequencies low to high.
+        freq_low_to_high = True
+        return self.inject_data(injdata, freq_low_to_high, **kwargs)
+
+    def get_bonsai_variances(self, beams=[],
+               servers=None, wait=True, timeout=-1):
+        if servers is None:
+            servers = self.servers.keys()
+        tokens = []
+        for k in servers:
+            self.token += 1
+            req = msgpack.packb(['get_bonsai_variances', self.token])
+            args = msgpack.packb(beams)
+            tokens.append(self.token)
+            self.sockets[k].send(req + args)
+        if not wait:
+            return tokens
+        parts = self.wait_for_tokens(tokens, timeout=timeout)
+        # We expect one message part for each token.
+        return [msgpack.unpackb(p[0]) if p is not None else None
+                for p in parts]
+
     ## the acq_beams should perhaps be a list of lists of beam ids,
     ## one list per L1 server.
     def stream(self, acq_name, acq_dev='', acq_meta='', acq_beams=[],
-               new_stream=True,
+               new_stream=True, max_chunks=0,
                servers=None, wait=True, timeout=-1):
         if servers is None:
             servers = self.servers.keys()
@@ -291,8 +609,9 @@ class RpcClient(object):
             acq_meta = str(acq_meta)
             acq_beams = [int(b) for b in acq_beams]
             new_stream = bool(new_stream)
+            max_chunks = int(max_chunks)
             args = msgpack.packb([acq_name, acq_dev, acq_meta, acq_beams,
-                                  new_stream])
+                                  new_stream, max_chunks])
             tokens.append(self.token)
             self.sockets[k].send(req + args)
         if not wait:
@@ -349,7 +668,7 @@ class RpcClient(object):
         '''
         Asks the RPC servers to write a set of chunks to disk.
 
-        *beams*: list of integer beams to writet to disk
+        *beams*: list of integer beams to write to disk
         *min_fgpa*, *max_fpga*: range of FPGA-counts to write
         *filename_pattern*: printf filename pattern
         *priority*: of writes.
@@ -407,11 +726,15 @@ class RpcClient(object):
                                         timeout=timeout)
 
     def wait_for_all_writes(self, chunklists, tokens, timeout=-1):
-        ## Wait for notification that all writes from a write_chunks
-        ## call have completed.
+        '''
+        Wait for notification that all writes from a write_chunks
+        call have completed.
+
+        *timeout* is in milliseconds.
+        '''
         results = []
         if timeout > 0:
-            t0 = time.time()
+            t0 = 1000. * time.time()
         for token,chunklist in zip(tokens, chunklists):
             if chunklist is None:
                 # Did not receive a reply from this server.
@@ -423,7 +746,7 @@ class RpcClient(object):
                                                get_sockets=True)
                 # adjust timeout
                 if timeout > 0:
-                    tnow = time.time()
+                    tnow = 1000. * time.time()
                     timeout = max(0, t0 + timeout - tnow)
                     t0 = tnow
                 if p is None:
@@ -511,6 +834,12 @@ class RpcClient(object):
             self.sockets[k].send(hdr + req)
 
     def get_masked_frequencies(self, servers=None, wait=True, timeout=-1):
+        '''
+        Deprecated; prefer get_summed_masked_frequencies.
+
+        Returns the most recent mask stats for all beams and places in
+        the RFI chain.
+        '''
         if servers is None:
             servers = self.servers.keys()
         tokens = []
@@ -528,8 +857,46 @@ class RpcClient(object):
                 else None
                 for p in parts]
 
+    def get_summed_masked_frequencies(self, fpgamin, fpgamax,
+                                      beam=-1, where='after_rfi',
+                                      servers=None, wait=True, timeout=-1):
+        '''
+        Returns summed statistics for the given range of times (in
+        FPGAcounts units) from *fpgamin* to *fpgamax*.
+
+        If *beam* is specified, returns only that beam; otherwise, all
+        beams.
+
+        *where*: where in the RFI pipeline to retrieve stats from.  In
+         production, we typically have only "before_rfi" and
+         "after_rfi" available.  This is before and after the L1 RFI
+         chain.
+
+        The return value is a list of *SummedMaskedFrequencies* objects.
+        '''
+        fpgamin = int(fpgamin)
+        fpgamax = int(fpgamax)
+        if servers is None:
+            servers = self.servers.keys()
+        tokens = []
+        for k in servers:
+            self.token += 1
+            req = msgpack.packb(['get_masked_frequencies_2', self.token])
+            args = msgpack.packb([beam, where, fpgamin, fpgamax])
+            tokens.append(self.token)
+            self.sockets[k].send(req + args)
+        if not wait:
+            return tokens
+        parts = self.wait_for_tokens(tokens, timeout=timeout)
+        # We expect one message part for each token.
+        return [SummedMaskedFrequencies.parse(msgpack.unpackb(p[0])) if p is not None
+                else None
+                for p in parts]
+
     def get_max_fpga_counts(self, servers=None, wait=True, timeout=-1):
         '''
+        Returns the largest (ie, last) FPGAcounts values seen at a
+        variety of places in the processing pipeline.
         '''
         if servers is None:
             servers = self.servers.keys()
@@ -625,23 +992,26 @@ class RpcClient(object):
         servers to reply.
 
         Returns a list of result messages, one for each *token*.
+
+        *timeout* is in milliseconds.
         '''
 
-        #print('Waiting for tokens (timeout', timeout, '):', tokens)
+        self.debug('Waiting for tokens (timeout', timeout, '):', tokens)
 
         results = {}
         if get_sockets:
             sockets = {}
         todo = [token for token in tokens]
         if timeout > 0:
-            t0 = time.time()
+            # note: time.time() is in seconds.
+            t0 = 1000. * time.time()
         while len(todo):
-            #print('Still waiting for tokens:', todo)
+            self.debug('Still waiting for tokens:', todo)
             done = []
             for token in todo:
                 r = self._pop_token(token, get_socket=get_sockets)
                 if r is not None:
-                    #print('Popped token', token, '->', r)
+                    self.debug('Popped token', token, '->', r)
                     done.append(token)
                     if get_sockets:
                         # unpack socket,result tuple
@@ -651,16 +1021,17 @@ class RpcClient(object):
             for token in done:
                 todo.remove(token)
             if len(todo):
-                #print('Receiving (timeout', timeout, ')')
+                self.debug('receive(timeout=', timeout, ')')
                 if not self._receive(timeout=timeout):
                     # timed out
-                    #print('timed out')
+                    self.debug('timed out')
                     break
                 # adjust timeout
                 if timeout > 0:
-                    tnow = time.time()
+                    tnow = 1000. * time.time()
                     timeout = max(0, t0 + timeout - tnow)
                     t0 = tnow
+        self.debug('Results:', results)
         if not get_sockets:
             return [results.get(token, None) for token in tokens]
         return ([results.get(token, None) for token in tokens],
@@ -711,6 +1082,10 @@ if __name__ == '__main__':
                         help='Send shutdown RPC message?')
     parser.add_argument('--log', action='store_true',
                         help='Start up chlog server?')
+    parser.add_argument('--fork', nargs=4, metavar=('<beam>','<beam offset>','<dest ip>','<dest port>'),
+                        help='Start forking data to the given IP:port with given beam offset.  beam=0 means all beams', action='append', default=[])
+    parser.add_argument('--stop-fork', nargs=4, metavar=('<beam>','<beam offset>','<dest ip>','<dest port>'),
+                        help='Stop forking data to the given IP:port with given beam offset.  beam=-1 and destbeam=-1 means stop all forks', action='append', default=[])
     parser.add_argument('--write', '-w', nargs=4, metavar='x',#['<comma-separated beams>', '<minfpga>', '<maxfpga>', '<filename-pattern>'],
                         help='Send write_chunks command: <comma-separated beams> <minfpga> <maxfpga> <filename-pattern>', action='append',
                         default=[])
@@ -722,24 +1097,38 @@ if __name__ == '__main__':
                         help='Just send list_chunks command and exit.')
     parser.add_argument('--stats', action='store_true', default=False,
                         help='Just request stats and exit.')
+    parser.add_argument('--assembler-misses', action='store_true', default=None,
+                        help='Send get_assembler_misses() RPC and exit.')
     parser.add_argument('--max-fpga', action='store_true', default=False,
                         help='Request max FPGA counts seen at different places in the pipeline.')
     parser.add_argument('--max-fpga-plot', type=float,
                         help='Request max FPGA counts seen at different places in the pipeline, for N seconds, and make a plot of the results.')
     parser.add_argument('--identity', help='(ignored)')
-    parser.add_argument('--stream', help='Stream to files')
+    parser.add_argument('--stream', help='Start streaming intensity data with this name')
     parser.add_argument('--stream-base', help='Stream base directory')
     parser.add_argument('--stream-meta', help='Stream metadata', default='')
     parser.add_argument('--stream-beams', action='append', default=[], help='Stream a subset of beams.  Can be a comma-separated list of integers.  Can be repeated.')
-    
+    parser.add_argument('--stream-max-chunks', type=int, default=0, help='Set a limit on the number of (1-second) chunks to stream to disk.')
     parser.add_argument('--rate', action='store_true', default=False,
                         help='Send packet rate matrix request')
     parser.add_argument('--rate-history', action='store_true', default=False,
                         help='Send packet rate history request')
     parser.add_argument('--l0', action='append', default=[],
                         help='Request rate history for the list of L0 nodes')
+    parser.add_argument('--inject', action='store_true', default=False,
+                        help='Inject some data')
+    parser.add_argument('--inject-pulse', action='store_true', default=False,
+                        help='Inject a simpulse pulse')
+    parser.add_argument('--variances', action='store_true', default=False,
+                        help='Request Bonsai input variance estimates')
     parser.add_argument('--masked-freqs', action='store_true', default=False,
                         help='Send request for masked frequencies history')
+    parser.add_argument('--masked-times', action='store_true', default=False,
+                        help='Send request for masked times history')
+    parser.add_argument('--spulsar-writer-params', action='append', nargs=3, metavar='y', default=[],
+                        help='Send new slow pulsar writer parameters: <nfreq_out> <nds_out> <nbits_out>')
+    parser.add_argument('--timeout', default=10000, type=float,
+                        help='Set timeout (in milliseconds) for all RPCs.  -1 to wait forever.')
     parser.add_argument('ports', nargs='*',
                         help='Addresses or port numbers of RPC servers to contact')
     opt = parser.parse_args()
@@ -770,8 +1159,10 @@ if __name__ == '__main__':
 
     doexit = False
 
+    kwa = dict(timeout=opt.timeout)
+
     if opt.list:
-        chunks = client.list_chunks()
+        chunks = client.list_chunks(**kwa)
         print('Received chunk list:', len(chunks))
         for chunklist in chunks:
             for beam,f0,f1,where in chunklist:
@@ -779,7 +1170,7 @@ if __name__ == '__main__':
         doexit = True
 
     if opt.stats:
-        stats = client.get_statistics(timeout=10)
+        stats = client.get_statistics(**kwa)
         for s,server in zip(stats, servers.values()):
             print('', server)
             if s is None:
@@ -794,8 +1185,52 @@ if __name__ == '__main__':
                 print()
         doexit = True
 
+    if opt.assembler_misses:
+        stats = client.get_assembler_misses(**kwa)
+        for m,server in zip(stats, servers.values()):
+            print('', server)
+            if m is None:
+                print('  None')
+                continue
+            print()
+
+            print('L0 node sender, Chunk number, Seconds late')
+            print('------------------------------------------')
+            for miss in m:
+                print('  ', miss)
+            print()
+
+            chunks = set([c for ip,c,sec in m])
+            chunks = list(sorted(list(chunks)))
+            #print('Chunks', chunks)
+            if len(chunks) >= 3:
+                # Take second chunk -- probably not truncated
+                chunk = chunks[1]
+            else:
+                # The the last chunk?
+                chunk = chunks[-1]
+
+            print('For chunk', chunk)
+            nodes = set()
+            for ip,ch,sec in m:
+                if ch != chunk:
+                    continue
+                print('L0 node', ip, 'is %.3f seconds late' % sec)
+                nodes.add(ip)
+            print()
+
+            print('Late nodes:')
+            for n in sorted(nodes):
+                print(n)
+
+            print('Late node names:')
+            for n in sorted(nodes):
+                print(gpu_node_name_from_ip(n))
+
+        doexit = True
+
     if opt.max_fpga:
-        fpgas = client.get_max_fpga_counts(timeout=10)
+        fpgas = client.get_max_fpga_counts(**kwa)
         for f,server in zip(fpgas, servers.values()):
             print('', server)
             if f is None:
@@ -822,7 +1257,7 @@ if __name__ == '__main__':
             t1 = time.time()
             if t1 - t0 > opt.max_fpga_plot:
                 break
-            fpgas = client.get_max_fpga_counts(wait=True, timeout=3.)
+            fpgas = client.get_max_fpga_counts(wait=True, **kwa)
             for f,server in zip(fpgas, servers.values()):
                 print('', server)
                 if f is None:
@@ -905,6 +1340,87 @@ if __name__ == '__main__':
 
         doexit = True
 
+    if len(opt.fork):
+        for beam, beam_offset, ipaddr, port in opt.fork:
+            beam = int(beam)
+            beam_offset = int(beam_offset)
+            port = int(port)
+            client.start_fork(beam_offset, ipaddr, port, beam=beam)
+        doexit = True
+
+    if len(opt.stop_fork):
+        for beam, beam_offset, ipaddr, port in opt.stop_fork:
+            beam = int(beam)
+            beam_offset = int(beam_offset)
+            port = int(port)
+            client.stop_fork(beam_offset, ipaddr, port, beam=beam)
+        doexit = True
+
+    if opt.variances:
+        import matplotlib
+        matplotlib.use('Agg')
+        import pylab as plt
+
+        results = client.get_bonsai_variances()
+        print('Got results: type', type(results))
+        print('Got', len(results), 'weights and variances')
+
+        # one per server
+        freqs = np.linspace(400, 800, 16384)
+
+        plt.clf()
+        minvar = 1e3
+        for variances in results:
+            for b,w,v in variances:
+                print('Beam', b, ':', len(w), 'weights, mean', np.mean(w), 'and', len(v), 'variances, mean', np.mean(v))
+                print('First weights:', w[:16])
+                print('First variances:', v[:16])
+                v = np.array(list(reversed(v)))
+                nz, = np.nonzero(v>0)
+                print('v', len(v), 'freqs', len(freqs))
+                plt.plot(freqs, v, '.', label='Beam %i' % int(b))
+                if len(nz):
+                    minvar = min(minvar, min(v[nz]))
+        plt.yscale('symlog', linthreshy=minvar)
+        yl,yh = plt.ylim()
+        plt.ylim(-0.1*minvar, yh)
+        plt.xlabel('Frequency (MHz)')
+        plt.ylabel('Variances')
+        plt.legend()
+        plt.title('Bonsai running variance estimates')
+        plt.savefig('bonsai-variances.png')
+
+        plt.clf()
+        # one per server
+        for variances in results:
+            for b,w,v in variances:
+                w = np.array(list(reversed(w)))
+                print('w', len(w), 'freqs', len(freqs))
+                plt.plot(freqs, w, '.', label='Beam %i' % int(b))
+        plt.ylim(-0.1, 1.5)
+        plt.ylabel('Weights')
+        plt.xlabel('Frequency (MHz)')
+        plt.legend()
+        plt.title('Bonsai running weight estimates (unmasked fraction)')
+        plt.savefig('bonsai-weights.png')
+
+        import fitsio
+        allbeams = []
+        allww = []
+        allvv = []
+        for variances in results:
+            for b,w,v in variances:
+                allbeams.append(b)
+                allww.append(w)
+                allvv.append(v)
+        allbeams = np.array(allbeams)
+        allww = np.vstack(allww)
+        allvv = np.vstack(allvv)
+        F = fitsio.FITS('bonsai-wv.fits', 'rw', clobber=True)
+        F.write(dict(beam=allbeams, weight=allww, variance=allvv))
+        F.close()
+        doexit = True
+
     if opt.stream:
         beams = []
         for b in opt.stream_beams:
@@ -912,12 +1428,13 @@ if __name__ == '__main__':
             words = b.split(',')
             for w in words:
                 beams.append(int(w))
-        patterns = client.stream(opt.stream, opt.stream_base, opt.stream_meta, beams)
+        patterns = client.stream(opt.stream, opt.stream_base, opt.stream_meta, beams,
+                                 max_chunks=opt.stream_max_chunks, **kwa)
         print('Streaming to:', patterns)
         doexit = True
 
     if opt.rate:
-        rates = client.get_packet_rate()
+        rates = client.get_packet_rate(**kwa)
         print('Received packet rates:')
         for r in rates:
             print('Got rate:', r)
@@ -928,7 +1445,7 @@ if __name__ == '__main__':
         matplotlib.use('Agg')
         import pylab as plt
 
-        freqs = client.get_masked_frequencies()
+        freqs = client.get_masked_frequencies(**kwa)
         print('Received masked frequencies:')
         for f in freqs:
             print('  ', f)
@@ -947,6 +1464,76 @@ if __name__ == '__main__':
                 plt.savefig('masked-f-%i-%s.png' % (beam, where))
         doexit = True
 
+    if opt.masked_times:
+        times = client.get_masked_times()
+        for t in times:
+            allbeams = set()
+            for k,v in t.histories.items():
+                (beam,where) = k
+                allbeams.add(beam)
+                hist = v
+                print('Beam', beam, 'at', where, ':', hist.shape, hist.dtype,
+                      hist.min(), hist.max())
+                plt.clf()
+                plt.plot(hist, '-')
+                plt.xlabel('Time (s)')
+                plt.ylabel('Fraction of masked samples')
+                plt.title('Beam %i, %s' % (beam, where))
+                plt.ylim(-0.01, 1.01)
+                plt.savefig('masked-t-%i-%s.png' % (beam, where))
+
+                plt.clf()
+                plt.plot(hist, '.', alpha=0.01)
+                # Compute average in 1-second chunks
+                avgs = np.zeros(len(hist)//1000)
+                for i in range(len(avgs)):
+                    avgs[i] = np.mean(hist[i*1000:(i+1)*1000])
+                avgts = 500 + np.arange(len(avgs))*1000
+                plt.plot(avgts, avgs, 'b-')
+                plt.xlabel('Time (s)')
+                plt.ylabel('Fraction of masked samples')
+                plt.title('Beam %i, %s' % (beam, where))
+                plt.ylim(-0.01, 1.01)
+                plt.savefig('masked-t2-%i-%s.png' % (beam, where))
+            allbeams = list(allbeams)
+            allbeams.sort()
+            for b in allbeams:
+                plt.clf()
+                for ii,(k,v) in enumerate(t.histories.items()):
+                    (beam,where) = k
+                    if beam != b:
+                        continue
+                    hist = v
+                    cc = 'brgm'[ii%4]
+                    # Compute average in 100-ms chunks
+                    avgs = np.zeros(len(hist)//100)
+                    for i in range(len(avgs)):
+                        avgs[i] = np.mean(hist[i*100:(i+1)*100])
+                    avgts = 50 + np.arange(len(avgs))*100
+                    plt.plot(avgts, avgs, '.', alpha=0.1, color=cc, label=where + ' (100 ms avg)')
+                    #plt.plot(hist, '.', alpha=0.1, color=cc, label=where)
+                    # Compute average in 1-second chunks
+                    avgs = np.zeros(len(hist)//1000)
+                    for i in range(len(avgs)):
+                        avgs[i] = np.mean(hist[i*1000:(i+1)*1000])
+                    avgts = 500 + np.arange(len(avgs))*1000
+                    plt.plot(avgts, avgs, '-', color=cc, label=where + ' (1 s avg)')
+                plt.xlabel('Time (s)')
+                plt.ylabel('Fraction of masked samples')
+                plt.title('Beam %i' % (beam))
+                plt.ylim(-0.01, 1.01)
+                plt.legend()
+                plt.savefig('masked-t-%i.png' % (beam))
+
+        doexit = True
+
+    if len(opt.spulsar_writer_params):
+        for nfreq_out, nds_out, nbits_out in opt.spulsar_writer_params: 
+            replies = client.set_spulsar_writer_params(nfreq_out, nds_out, nbits_out)
+            for r in replies:
+                print(replies)
+        doexit = True
+
     if opt.rate_history:
         kwa = {}
         if len(opt.l0):
@@ -955,14 +1542,14 @@ if __name__ == '__main__':
         print('Received packet rate history:')
         print(rates)
         doexit = True
-        
+
     if len(opt.write):
         for beams, f0, f1, fnpat in opt.write:
             beams = beams.split(',')
             beams = [int(b,10) for b in beams]
             f0 = int(f0, 10)
             f1 = int(f1, 10)
-            kwargs = {}
+            kwargs = kwa.copy()
             if opt.need_rfi:
                 kwargs.update(need_rfi = True)
             R = client.write_chunks(beams, f0, f1, fnpat, **kwargs)
@@ -990,15 +1577,57 @@ if __name__ == '__main__':
                     print('  ', r)
         doexit = True
 
+    if opt.inject:
+        beam = 10008
+        #fpga0 = 52 * 1024 * 384
+        #fpga0 = 5 * 1024 * 384
+        #fpga0 = 6820000000
+        nfreq = 16384
+        sample_offsets = np.zeros(nfreq, np.int32)
+        data = []
+        for f in range(nfreq):
+            sample_offsets[f] = int(0.2 * f)
+            data.append(100. * np.ones(1000, np.float32))
+        print('Injecting data spanning', np.min(sample_offsets), 'to', np.max(sample_offsets), ' samples')
+        inj = InjectData(beam, 0, fpga0, sample_offsets, data)
+        freq_low_to_high = True
+        R = client.inject_data(inj, freq_low_to_high, wait=True, **kwa)
+        print('Results:', R)
+
+        doexit = True
+
+    if opt.inject_pulse:
+        import simpulse
+
+        pulse_nt = 1024
+        nfreq = 16384
+        freq_lo = 400.
+        freq_hi = 800.
+        #dm = 50.
+        dm = 666.
+        sm = 1.
+        width = 0.003
+        fluence = 0.1
+        spectral_index = -1.
+        undispersed_t = 5.
+        sp = simpulse.single_pulse(pulse_nt, nfreq, freq_lo, freq_hi, dm, sm, width, fluence, spectral_index, undispersed_t)
+        #fpga0 = 0
+        beam = 10008
+        fpga0 = 17730 * 1024 * 384
+        R = client.inject_single_pulse(beam, sp, fpga0, wait=True, nfreq=nfreq, **kwa)
+        print('Results:', R)
+        
+        doexit = True
+        
     if doexit:
         sys.exit(0)
     
     print('get_statistics()...')
-    stats = client.get_statistics(timeout=3000)
+    stats = client.get_statistics(**kwa)
     print('Got stats:', stats)
 
     print('list_chunks()...')
-    stats = client.list_chunks(timeout=3000)
+    stats = client.list_chunks(**kwa)
     print('Got chunks:', stats)
     
     print()
@@ -1008,26 +1637,26 @@ if __name__ == '__main__':
     #maxfpga = 38600000
     maxfpga = 48600000
 
-    R = client.write_chunks([77,78], minfpga, maxfpga, 'chunk-beam(BEAM)-chunk(CHUNK)+(NCHUNK).msgpack', timeout=3000)
+    R = client.write_chunks([77,78], minfpga, maxfpga, 'chunk-beam(BEAM)-chunk(CHUNK)+(NCHUNK).msgpack', **kwa)
     print('Got:', R)
 
     for r in R:
         servers = [r.server]
         print('Received', r, 'from server:', r.server)
-        X = client.get_writechunk_status(r.filename, servers=servers)
+        X = client.get_writechunk_status(r.filename, servers=servers, **kwa)
         X = X[0]
         print('Result:', X)
 
-    print('Bogus result:', client.get_writechunk_status('nonesuch'))
+    print('Bogus result:', client.get_writechunk_status('nonesuch', **kwa))
 
-    chunks,tokens = client.write_chunks([77,78], minfpga, maxfpga, 'chunk2-beam(BEAM)-chunk(CHUNK)+(NCHUNK).msgpack', waitAll=False)
+    chunks,tokens = client.write_chunks([77,78], minfpga, maxfpga, 'chunk2-beam(BEAM)-chunk(CHUNK)+(NCHUNK).msgpack', waitAll=False, **kwa)
     print('Got chunks:', chunks)
     for chlist in chunks:
         if chlist is None:
             continue
         for chunk in chlist:
             print('Chunk:', chunk)
-            [R] = client.get_writechunk_status(chunk.filename, servers=[chunk.server])
+            [R] = client.get_writechunk_status(chunk.filename, servers=[chunk.server], **kwa)
             print('Status:', R)
     time.sleep(1)
     for chlist in chunks:
@@ -1035,7 +1664,7 @@ if __name__ == '__main__':
             continue
         for chunk in chlist:
             print('Chunk:', chunk)
-            [R] = client.get_writechunk_status(chunk.filename, servers=[chunk.server])
+            [R] = client.get_writechunk_status(chunk.filename, servers=[chunk.server], **kwa)
             print('Status:', R)
 
     if opt.log:

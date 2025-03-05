@@ -84,8 +84,7 @@ int main(int argc, char** argv) {
     }
     
     intensity_network_stream::initializer ini;
-    for (int beam: beams)
-        ini.beam_ids.push_back(beam);
+    ini.nbeams = beams.size();
     ini.nupfreq = nupfreq;
     ini.nt_per_packet = nt_per;
     ini.fpga_counts_per_sample = fpga_per;
@@ -118,6 +117,7 @@ int main(int argc, char** argv) {
 
     prometheus_ip = prometheus_ip + to_string(prometheus_port);
     shared_ptr<ch_frb_l1::mask_stats_map> ms = make_shared<ch_frb_l1::mask_stats_map>();
+    shared_ptr<ch_frb_l1::slow_pulsar_writer_hash> sp = make_shared<ch_frb_l1::slow_pulsar_writer_hash>();
     shared_ptr<L1PrometheusServer> prometheus_server =
         start_prometheus_server(prometheus_ip, stream, ms);
     if (!prometheus_server) {
@@ -135,7 +135,9 @@ int main(int argc, char** argv) {
 
     chlog("Starting RPC server on port " << port);
     vector<shared_ptr<const bonsai::dedisperser> > bonsais;
-    L1RpcServer rpc(stream, ms, bonsais, port);
+    std::vector<std::shared_ptr<rf_pipelines::intensity_injector> > inj;
+    std::shared_ptr<std::atomic<bool>> is_alive;
+    L1RpcServer rpc(stream, inj, ms, sp, is_alive, bonsais, true, port);
     std::thread rpc_thread = rpc.start();
 
     std::random_device rd;

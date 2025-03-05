@@ -30,6 +30,7 @@ struct l0_params {
 
     void send_chunks(int istream, const std::vector<std::shared_ptr<ch_frb_io::assembled_chunk> > &chunks);
 
+    void stream_chunk_files(int istream, const std::vector<std::string> &filenames);
 
     std::vector<std::shared_ptr<ch_frb_io::intensity_network_ostream> > streams;
     
@@ -39,6 +40,7 @@ struct l0_params {
     int nthreads_tot = 0;
     int nfreq_fine = 0;
     int nt_per_packet = 0;
+    int beam_offset;
 
     // The 'ipaddr' and 'port' vectors have the same length 'nstreams'
     // nstreams evenly divides nthreads.
